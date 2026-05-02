@@ -8,6 +8,7 @@ const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 
 const authRoutes = require('./routes/auth');
+const reflectionRoutes = require('./routes/reflections');
 
 const app = express();
 
@@ -49,6 +50,7 @@ app.set('db', db);
 // Routes
 // ---------------------------------------------------------------------------
 app.use('/auth', authRoutes);
+app.use('/reflections', reflectionRoutes);
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
 
