@@ -224,9 +224,13 @@ async function verifyMagicLink(db, { token }) {
 /**
  * POST /auth/refresh
  *
- * Refresh token rotation: invalidates the presented token and issues a new pair.
- * Detects token reuse (theft signal) by checking if the token was already rotated:
- * if so, revoke the entire family.
+ * Refresh token rotation: atomically revokes the presented token and issues a
+ * new pair. Mirrors verifyMagicLink's UPDATE-with-conditions pattern to prevent
+ * the SELECT+UPDATE race condition — two concurrent requests with the same token
+ * can't both pass the revoked_at IS NULL guard.
+ *
+ * Theft detection: if a token that has already been rotated (revoked_at IS NOT NULL)
+ * is presented, the entire token family is revoked, forcing re-authentication.
  */
 async function rotateRefreshToken(db, { refreshToken, ip }) {
   if (!refreshToken) {
@@ -237,56 +241,67 @@ async function rotateRefreshToken(db, { refreshToken, ip }) {
 
   const tokenHash = sha256(refreshToken);
 
+  // Atomic revocation: only one concurrent request can win this UPDATE.
   const { rows } = await db.query(
-    `SELECT rt.*, u.*
-     FROM refresh_tokens rt
-     JOIN users u ON u.id = rt.user_id
-     WHERE rt.token_hash = $1
-     LIMIT 1`,
+    `UPDATE refresh_tokens
+     SET revoked_at = NOW()
+     WHERE token_hash = $1
+       AND revoked_at IS NULL
+       AND expires_at > NOW()
+     RETURNING *`,
     [tokenHash]
   );
 
   if (!rows.length) {
-    const err = new Error('Invalid refresh token');
+    // No live token matched. Look up the token to distinguish the three cases:
+    // 1. Never existed → invalid token
+    // 2. revoked_at IS NOT NULL → reuse detected (theft signal) → revoke family
+    // 3. Exists, not revoked, expires_at <= NOW() → expired
+    const { rows: existing } = await db.query(
+      `SELECT id, family, revoked_at, expires_at FROM refresh_tokens WHERE token_hash = $1`,
+      [tokenHash]
+    );
+
+    if (!existing.length) {
+      const err = new Error('Invalid refresh token');
+      err.statusCode = 401;
+      throw err;
+    }
+
+    if (existing[0].revoked_at !== null) {
+      await db.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW() WHERE family = $1 AND revoked_at IS NULL`,
+        [existing[0].family]
+      );
+      const err = new Error('Refresh token reuse detected; all sessions invalidated');
+      err.statusCode = 401;
+      throw err;
+    }
+
+    const err = new Error('Refresh token expired');
     err.statusCode = 401;
     throw err;
   }
 
   const record = rows[0];
 
-  // Token reuse detection: already revoked → revoke entire family (stolen token)
-  if (record.revoked_at !== null) {
-    await db.query(
-      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE family = $1`,
-      [record.family]
-    );
-    const err = new Error('Refresh token reuse detected; all sessions invalidated');
-    err.statusCode = 401;
-    throw err;
-  }
-
-  if (new Date(record.expires_at) < new Date()) {
-    const err = new Error('Refresh token expired');
-    err.statusCode = 401;
-    throw err;
-  }
-
-  // Revoke old token
-  await db.query(
-    `UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`,
-    [record.id]
-  );
-
   // Issue new token in the same family
   const { raw: newRaw, hash: newHash } = generateRefreshToken();
 
-  await db.query(
+  const { rows: insertedRows } = await db.query(
     `INSERT INTO refresh_tokens (user_id, token_hash, family, expires_at, last_used_ip)
-     VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', $4)`,
+     VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', $4)
+     RETURNING id`,
     [record.user_id, newHash, record.family, ip || null]
   );
 
-  // Re-fetch user (in case it was updated)
+  // Record audit trail: old token → new token
+  await db.query(
+    `UPDATE refresh_tokens SET replaced_by_id = $1 WHERE id = $2`,
+    [insertedRows[0].id, record.id]
+  );
+
+  // Re-fetch user (may have been updated since the token was issued)
   const { rows: userRows } = await db.query(
     `SELECT * FROM users WHERE id = $1`,
     [record.user_id]

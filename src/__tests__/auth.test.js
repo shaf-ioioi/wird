@@ -6,7 +6,6 @@
  */
 
 process.env.JWT_ACCESS_SECRET = 'test-access-secret-32chars-padded!!';
-process.env.JWT_REFRESH_SECRET = 'test-refresh-secret-32chars-paddd!';
 process.env.NODE_ENV = 'test';
 
 const authService = require('../services/authService');
@@ -110,7 +109,7 @@ function createMockDb() {
         return { rows };
       }
 
-      // INSERT INTO refresh_tokens
+      // INSERT INTO refresh_tokens ... RETURNING id  (or no returning)
       if (s.startsWith('insert into refresh_tokens')) {
         const token = {
           id: `rt-${seq++}`,
@@ -127,29 +126,38 @@ function createMockDb() {
         return { rows: [token] };
       }
 
-      // SELECT rt.*, u.* FROM refresh_tokens rt JOIN users
-      if (s.includes('from refresh_tokens rt') && s.includes('join users')) {
+      // Atomic revocation: UPDATE refresh_tokens SET revoked_at WHERE token_hash AND revoked_at IS NULL AND expires_at
+      if (s.startsWith('update refresh_tokens') && s.includes('token_hash') && s.includes('revoked_at is null') && s.includes('returning')) {
         const [hash] = params;
-        const rt = tables.refresh_tokens.find(t => t.token_hash === hash);
+        const rt = tables.refresh_tokens.find(
+          t => t.token_hash === hash && t.revoked_at === null && new Date(t.expires_at) > new Date()
+        );
         if (!rt) return { rows: [] };
-        const user = tables.users.find(u => u.id === rt.user_id);
-        return { rows: rt ? [{ ...rt, ...user }] : [] };
+        rt.revoked_at = new Date().toISOString();
+        return { rows: [rt] };
       }
 
-      // UPDATE refresh_tokens SET revoked_at WHERE id
-      if (s.startsWith('update refresh_tokens') && s.includes('where id')) {
-        const [id] = params;
-        const rt = tables.refresh_tokens.find(t => t.id === id);
-        if (rt) rt.revoked_at = new Date().toISOString();
+      // Fallback lookup: SELECT id, family, revoked_at, expires_at FROM refresh_tokens WHERE token_hash
+      if (s.startsWith('select') && s.includes('from refresh_tokens') && s.includes('token_hash')) {
+        const [hash] = params;
+        const rows = tables.refresh_tokens.filter(t => t.token_hash === hash);
+        return { rows };
+      }
+
+      // Family revocation: UPDATE refresh_tokens SET revoked_at WHERE family AND revoked_at IS NULL
+      if (s.startsWith('update refresh_tokens') && s.includes('family') && s.includes('revoked_at is null')) {
+        const [family] = params;
+        tables.refresh_tokens
+          .filter(t => t.family === family && t.revoked_at === null)
+          .forEach(t => { t.revoked_at = new Date().toISOString(); });
         return { rows: [] };
       }
 
-      // UPDATE refresh_tokens SET revoked_at WHERE family (theft revocation)
-      if (s.startsWith('update refresh_tokens') && s.includes('where family')) {
-        const [family] = params;
-        tables.refresh_tokens
-          .filter(t => t.family === family)
-          .forEach(t => { t.revoked_at = new Date().toISOString(); });
+      // Audit trail: UPDATE refresh_tokens SET replaced_by_id WHERE id
+      if (s.startsWith('update refresh_tokens') && s.includes('replaced_by_id')) {
+        const [newId, oldId] = params;
+        const rt = tables.refresh_tokens.find(t => t.id === oldId);
+        if (rt) rt.replaced_by_id = newId;
         return { rows: [] };
       }
 
@@ -259,12 +267,10 @@ describe('POST /auth/login (verifyMagicLink)', () => {
     const db = createMockDb();
 
     await authService.initiateSignup(db, { email: 'login@example.com' });
-    // In dev mode, _devMagicToken is returned
-    const signupResult = await authService.initiateSignup(db, { email: 'login2@example.com' });
 
-    // Manually grab the raw token from the mock (simulate email click)
+    // Manually insert a known token into the mock (simulates email click)
     const crypto = require('crypto');
-    const rawToken = require('crypto').randomBytes(32).toString('hex');
+    const rawToken = crypto.randomBytes(32).toString('hex');
     const hash = crypto.createHash('sha256').update(rawToken).digest('hex');
     const user = db._tables.users[db._tables.users.length - 1];
     db._tables.magic_link_tokens.push({
@@ -303,7 +309,7 @@ describe('POST /auth/login (verifyMagicLink)', () => {
 });
 
 describe('POST /auth/refresh (rotateRefreshToken)', () => {
-  test('issues new token pair and revokes old refresh token', async () => {
+  test('issues new token pair and atomically revokes old refresh token', async () => {
     const db = createMockDb();
     const deviceToken = '550e8400-e29b-41d4-a716-446655440002';
 
@@ -313,11 +319,16 @@ describe('POST /auth/refresh (rotateRefreshToken)', () => {
     expect(result.accessToken).toBeTruthy();
     expect(result.refreshToken).not.toBe(refreshToken);
 
-    // Old token should be revoked
+    // Old token must be revoked
     const crypto = require('crypto');
     const oldHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
     const old = db._tables.refresh_tokens.find(t => t.token_hash === oldHash);
     expect(old.revoked_at).toBeTruthy();
+
+    // Audit trail: old token must point to new token
+    const newHash = crypto.createHash('sha256').update(result.refreshToken).digest('hex');
+    const newToken = db._tables.refresh_tokens.find(t => t.token_hash === newHash);
+    expect(old.replaced_by_id).toBe(newToken.id);
   });
 
   test('detects token reuse and revokes entire family', async () => {
@@ -335,5 +346,26 @@ describe('POST /auth/refresh (rotateRefreshToken)', () => {
     // All tokens in the family should be revoked
     const allRevoked = db._tables.refresh_tokens.every(t => t.revoked_at !== null);
     expect(allRevoked).toBe(true);
+  });
+
+  test('rejects expired refresh token', async () => {
+    const db = createMockDb();
+    const crypto = require('crypto');
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const hash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    db._tables.users.push({ id: 'u-exp', is_anonymous: false, email: null });
+    db._tables.refresh_tokens.push({
+      id: 'rt-exp',
+      user_id: 'u-exp',
+      token_hash: hash,
+      family: 'fam-exp',
+      expires_at: new Date(Date.now() - 1000).toISOString(), // expired
+      revoked_at: null,
+      replaced_by_id: null,
+    });
+
+    await expect(
+      authService.rotateRefreshToken(db, { refreshToken: rawToken })
+    ).rejects.toMatchObject({ statusCode: 401, message: /expired/i });
   });
 });
