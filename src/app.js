@@ -5,7 +5,7 @@ require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { Pool } = require('pg');
+const db = require('./db/pool');
 
 const authRoutes = require('./routes/auth');
 const reflectionRoutes = require('./routes/reflections');
@@ -38,12 +38,6 @@ app.use(
 // ---------------------------------------------------------------------------
 // Database pool (shared across requests via app.set)
 // ---------------------------------------------------------------------------
-const db = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false,
-  max: 10,
-  idleTimeoutMillis: 30_000,
-});
 app.set('db', db);
 
 // ---------------------------------------------------------------------------

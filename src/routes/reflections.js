@@ -2,6 +2,7 @@
 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
+const { requireAuth } = require('../middleware/auth');
 const { getLastReflections, getSeenAyahs, insertReflection, findSimilarReflections } = require('../db/reflections');
 const { generateReflectionPrompt, generateTafsirConnection } = require('../reflections/claudeService');
 const { generateEmbedding, formatForPgVector } = require('../reflections/embeddingService');
@@ -10,14 +11,16 @@ const { getTafsir, buildAyahText, getKnownAyahRefs } = require('../reflections/t
 
 const router = express.Router();
 
-const reflectionLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+router.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
-router.use(reflectionLimiter);
+router.use(requireAuth);
 
 const AYAH_REF_RE = /^\d{1,3}:\d{1,3}$/;
 
@@ -26,13 +29,9 @@ const AYAH_REF_RE = /^\d{1,3}:\d{1,3}$/;
 // ---------------------------------------------------------------------------
 router.post('/prompt', async (req, res, next) => {
   try {
-    const { user_id, ayah_ref } = req.body;
-    if (!user_id) {
-      const err = new Error('user_id is required');
-      err.statusCode = 400;
-      err.code = 'VALIDATION_ERROR';
-      return next(err);
-    }
+    const user_id = req.user.id;
+    const { ayah_ref } = req.body;
+
     if (!ayah_ref || !AYAH_REF_RE.test(ayah_ref)) {
       const err = new Error('ayah_ref must be in format surah:ayah (e.g. 13:28)');
       err.statusCode = 400;
@@ -42,7 +41,7 @@ router.post('/prompt', async (req, res, next) => {
 
     const tafsirEntry = getTafsir(ayah_ref);
     const ayahText = buildAyahText(tafsirEntry);
-    const [recentReflections] = await Promise.all([getLastReflections(user_id)]);
+    const recentReflections = await getLastReflections(user_id);
 
     const { prompt, cached, fallback } = await generateReflectionPrompt({
       ayahRef: ayah_ref,
@@ -62,14 +61,9 @@ router.post('/prompt', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 router.post('/submit', async (req, res, next) => {
   try {
-    const { user_id, ayah_ref, prompt, response_text } = req.body;
+    const user_id = req.user.id;
+    const { ayah_ref, prompt, response_text } = req.body;
 
-    if (!user_id) {
-      const err = new Error('user_id is required');
-      err.statusCode = 400;
-      err.code = 'VALIDATION_ERROR';
-      return next(err);
-    }
     if (!ayah_ref || !AYAH_REF_RE.test(ayah_ref)) {
       const err = new Error('ayah_ref must be in format surah:ayah (e.g. 13:28)');
       err.statusCode = 400;
@@ -136,13 +130,7 @@ router.post('/submit', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 router.get('/threads', async (req, res, next) => {
   try {
-    const { user_id } = req.query;
-    if (!user_id) {
-      const err = new Error('user_id query parameter is required');
-      err.statusCode = 400;
-      err.code = 'VALIDATION_ERROR';
-      return next(err);
-    }
+    const user_id = req.user.id;
 
     const [recentReflections, seenAyahs] = await Promise.all([
       getLastReflections(user_id, 10),
@@ -165,9 +153,10 @@ router.get('/threads', async (req, res, next) => {
 
     const knownRefs = getKnownAyahRefs();
     const unseenRefs = knownRefs.filter((ref) => !seenAyahs.includes(ref));
-    const nextAyah = unseenRefs.length > 0
-      ? unseenRefs[Math.floor(Math.random() * unseenRefs.length)]
-      : knownRefs[Math.floor(Math.random() * knownRefs.length)];
+    const nextAyah =
+      unseenRefs.length > 0
+        ? unseenRefs[Math.floor(Math.random() * unseenRefs.length)]
+        : knownRefs[Math.floor(Math.random() * knownRefs.length)];
 
     threads = similarReflections.map((r) => ({
       reflection_id: r.id,

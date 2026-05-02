@@ -2,7 +2,7 @@
 
 const Anthropic = require('@anthropic-ai/sdk');
 
-const MODEL = 'claude-haiku-4-5';
+const MODEL = 'claude-haiku-4-5-20251001';
 const TIMEOUT_MS = 15_000;
 
 const SYSTEM_PERSONA =

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Integration-style route tests (mocked DB + Claude).
+ * Integration-style route tests (mocked DB + Claude + auth).
  */
 
 jest.mock('../src/db/reflections', () => ({
@@ -39,35 +39,51 @@ jest.mock('../src/db/pool', () => ({
   query: jest.fn().mockResolvedValue({ rows: [] }),
 }));
 
+// Mock auth middleware — default injects req.user; tests can override per-call
+jest.mock('../src/middleware/auth', () => ({
+  requireAuth: jest.fn(),
+}));
+
 const request = require('supertest');
+const { requireAuth } = require('../src/middleware/auth');
 const app = require('../src/app');
 
+beforeEach(() => {
+  requireAuth.mockImplementation((req, _res, next) => {
+    req.user = { id: 'user-1', anon: false };
+    next();
+  });
+});
+
 describe('POST /reflections/prompt', () => {
-  test('returns 400 if user_id missing', async () => {
+  test('returns 401 if not authenticated', async () => {
+    requireAuth.mockImplementationOnce((_req, res) =>
+      res.status(401).json({ error: 'Missing authorization header', code: 'UNAUTHORIZED' })
+    );
     const res = await request(app)
       .post('/reflections/prompt')
       .send({ ayah_ref: '13:28' });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(401);
   });
 
   test('returns 400 if ayah_ref missing', async () => {
     const res = await request(app)
       .post('/reflections/prompt')
-      .send({ user_id: 'user-1' });
+      .send({});
     expect(res.status).toBe(400);
   });
 
   test('returns 400 for invalid ayah_ref format', async () => {
     const res = await request(app)
       .post('/reflections/prompt')
-      .send({ user_id: 'user-1', ayah_ref: 'invalid' });
+      .send({ ayah_ref: 'invalid' });
     expect(res.status).toBe(400);
   });
 
   test('returns prompt for valid cached ayah', async () => {
     const res = await request(app)
       .post('/reflections/prompt')
-      .send({ user_id: 'user-1', ayah_ref: '13:28' });
+      .send({ ayah_ref: '13:28' });
     expect(res.status).toBe(200);
     expect(res.body.prompt).toBeDefined();
     expect(res.body.ayah_ref).toBe('13:28');
@@ -75,17 +91,27 @@ describe('POST /reflections/prompt', () => {
 });
 
 describe('POST /reflections/submit', () => {
+  test('returns 401 if not authenticated', async () => {
+    requireAuth.mockImplementationOnce((_req, res) =>
+      res.status(401).json({ error: 'Missing authorization header', code: 'UNAUTHORIZED' })
+    );
+    const res = await request(app)
+      .post('/reflections/submit')
+      .send({ ayah_ref: '13:28', prompt: 'Test prompt' });
+    expect(res.status).toBe(401);
+  });
+
   test('returns 400 if response_text missing', async () => {
     const res = await request(app)
       .post('/reflections/submit')
-      .send({ user_id: 'user-1', ayah_ref: '13:28', prompt: 'Test prompt' });
+      .send({ ayah_ref: '13:28', prompt: 'Test prompt' });
     expect(res.status).toBe(400);
   });
 
   test('returns 400 if response_text too short', async () => {
     const res = await request(app)
       .post('/reflections/submit')
-      .send({ user_id: 'user-1', ayah_ref: '13:28', prompt: 'Test', response_text: 'short' });
+      .send({ ayah_ref: '13:28', prompt: 'Test', response_text: 'short' });
     expect(res.status).toBe(400);
   });
 
@@ -93,7 +119,6 @@ describe('POST /reflections/submit', () => {
     const res = await request(app)
       .post('/reflections/submit')
       .send({
-        user_id: 'user-1',
         ayah_ref: '13:28',
         prompt: 'How does this ayah speak to you?',
         response_text: 'This ayah reminds me that peace is found only in remembrance of Allah, not in external circumstances.',
@@ -106,13 +131,16 @@ describe('POST /reflections/submit', () => {
 });
 
 describe('GET /reflections/threads', () => {
-  test('returns 400 if user_id missing', async () => {
+  test('returns 401 if not authenticated', async () => {
+    requireAuth.mockImplementationOnce((_req, res) =>
+      res.status(401).json({ error: 'Missing authorization header', code: 'UNAUTHORIZED' })
+    );
     const res = await request(app).get('/reflections/threads');
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(401);
   });
 
   test('returns demo insight for user with no embeddings', async () => {
-    const res = await request(app).get('/reflections/threads?user_id=user-1');
+    const res = await request(app).get('/reflections/threads');
     expect(res.status).toBe(200);
     expect(res.body.threads).toBeDefined();
     expect(Array.isArray(res.body.threads)).toBe(true);
